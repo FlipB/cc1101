@@ -21,6 +21,8 @@ pub enum Error<SpiE, GpioE> {
     RxOverflow,
     /// Corrupt packet received with invalid CRC.
     CrcMismatch,
+    /// Unknown state
+    UnknownState,
     /// Platform-dependent SPI-errors, such as IO errors.
     Spi(SpiE),
     /// Platform-dependent GPIO-errors, such as IO errors.
@@ -53,6 +55,24 @@ where
         self.0.write_register(Config::FREQ0, freq0)?;
         self.0.write_register(Config::FREQ1, freq1)?;
         self.0.write_register(Config::FREQ2, freq2)?;
+
+        // get configured modulation setting.
+        let modulation = {
+            let reg = MDMCFG2(self.0.read_register(Config::MDMCFG2)?);
+
+            match reg.mod_format() {
+                0x00 => ModFormat::MOD_2FSK,
+                0x01 => ModFormat::MOD_GFSK,
+                0x03 => ModFormat::MOD_ASK_OOK,
+                0x04 => ModFormat::MOD_4FSK,
+                0x07 => ModFormat::MOD_MSK,
+                _ => return Err(Error::UnknownState),
+            }
+        };
+
+        // set 12dBm output power as the default
+        // TODO: investigate using FREND0 and a real power table.
+        self.update_pa_table(hz, modulation, 12)?;
         Ok(())
     }
 
@@ -116,7 +136,9 @@ where
         Ok(())
     }
 
-    /// Configure signal modulation.
+    /// Configure signal modulation. FIXME: Should be called before setting frequency.
+    /// This is because setting the frequency also updates the pa tables (which should be done
+    /// after changing modulation)
     pub fn set_modulation(&mut self, format: Modulation) -> Result<(), Error<SpiE, GpioE>> {
         use lowlevel::types::ModFormat as MF;
 
@@ -130,6 +152,15 @@ where
         self.0.modify_register(Config::MDMCFG2, |r| {
             MDMCFG2(r).modify().mod_format(value.value()).bits()
         })?;
+
+        // to update power table we need the frequency.
+
+        let freq0 = self.0.read_register(Config::FREQ0)?;
+        let freq1 = self.0.read_register(Config::FREQ1)?;
+        let freq2 = self.0.read_register(Config::FREQ2)?;
+
+        self.update_pa_table(to_frequency((freq0, freq1, freq2)), value, 12)?;
+
         Ok(())
     }
 
@@ -171,46 +202,91 @@ where
         let target = match radio_mode {
             RadioMode::Receive => {
                 self.set_radio_mode(RadioMode::Idle)?;
+                self.await_machine_state(MachineState::IDLE)?;
                 self.0.write_strobe(Command::SRX)?;
                 MachineState::RX
             }
             RadioMode::Transmit => {
                 self.set_radio_mode(RadioMode::Idle)?;
+                self.await_machine_state(MachineState::IDLE)?;
                 self.0.write_strobe(Command::STX)?;
                 MachineState::TX
             }
             RadioMode::Idle => {
                 self.0.write_strobe(Command::SIDLE)?;
+                self.await_machine_state(MachineState::IDLE)?;
                 MachineState::IDLE
             }
         };
         self.await_machine_state(target)
     }
 
+    fn update_pa_table(
+        &mut self,
+        hz: u64,
+        modulation: ModFormat,
+        output_power_dbm: i32,
+    ) -> Result<(), Error<SpiE, GpioE>> {
+        // currently only use first two values of the power table, due to the
+        // FREND0 setting.
+        // TODO: investigate using the full power table.
+        let mut pa_table = [0x00u8, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        // let mut pa_table = lowlevel::pa_table::pa_table(hz).values();
+
+        let pa_level = lowlevel::pa_table::pa_table(hz).output_power_value(output_power_dbm);
+
+        match modulation {
+            ModFormat::MOD_ASK_OOK => {
+                pa_table[0] = 0x00;
+                pa_table[1] = pa_level
+            }
+            _ => pa_table[0] = pa_level,
+        }
+
+        self.0.write_register_burst(Command::PATABLE, &pa_table)?;
+
+        match modulation {
+            ModFormat::MOD_ASK_OOK => {
+                self.0.write_register(Config::FREND0, FREND0::default().pa_power(1).bits())?;
+            }
+            _ => {
+                self.0.write_register(Config::FREND0, FREND0::default().pa_power(0).bits())?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Configure some default settings, to be removed in the future.
-    #[cfg_attr(rustfmt, rustfmt_skip)]
     pub fn set_defaults(&mut self) -> Result<(), Error<SpiE, GpioE>> {
         self.0.write_strobe(Command::SRES)?;
 
-        self.0.write_register(Config::PKTCTRL0, PKTCTRL0::default()
-            .white_data(0).bits()
+        // pkt_format 3 enables asynchronous (compatibility) mode - GDO pins can be used for RX and TX if iocfg is configured.
+        self.0.write_register(
+            Config::PKTCTRL0,
+            PKTCTRL0::default().white_data(0).pkt_format(3).bits(),
         )?;
 
-        self.0.write_register(Config::FSCTRL1, FSCTRL1::default()
-            .freq_if(0x08).bits() // f_if = (f_osc / 2^10) * FREQ_IF
+        // Enable input/output on GDO0 and GDO2.
+        // GDO0 is used for TX in TX mode. See section 27.1 for more info.
+        self.0.write_register(Config::IOCFG2, 0x0D)?;
+        self.0.write_register(Config::IOCFG0, 0x0D)?;
+        //FREND0 should be updated when modulation changes and perhaps when PA table changes.
+        self.0.write_register(Config::FREND0, FREND0::default().bits())?;
+
+        self.0.write_register(
+            Config::FSCTRL1,
+            FSCTRL1::default().freq_if(0x08).bits(), // f_if = (f_osc / 2^10) * FREQ_IF
         )?;
 
-        self.0.write_register(Config::MDMCFG2, MDMCFG2::default()
-            .dem_dcfilt_off(1).bits()
+        self.0.write_register(Config::MDMCFG2, MDMCFG2::default().dem_dcfilt_off(1).bits())?;
+
+        self.0.write_register(
+            Config::MCSM0,
+            MCSM0::default().fs_autocal(AutoCalibration::FROM_IDLE.value()).bits(),
         )?;
 
-        self.0.write_register(Config::MCSM0, MCSM0::default()
-            .fs_autocal(AutoCalibration::FROM_IDLE.value()).bits()
-        )?;
-
-        self.0.write_register(Config::AGCCTRL2, AGCCTRL2::default()
-            .max_lna_gain(0x04).bits()
-        )?;
+        self.0.write_register(Config::AGCCTRL2, AGCCTRL2::default().max_lna_gain(0x04).bits())?;
 
         Ok(())
     }

@@ -12,6 +12,7 @@
 ## What works
 
 - Configuring radio for reception, and reading data.
+- Sending data in asynchronous mode (by driving GDO0 pin)
 
 ## TODO
 

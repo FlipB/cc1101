@@ -8,6 +8,7 @@ mod access;
 mod traits;
 
 pub mod convert;
+pub mod pa_table;
 pub mod registers;
 pub mod types;
 
@@ -34,10 +35,7 @@ where
     CS: OutputPin<Error = GpioE>,
 {
     pub fn new(spi: SPI, cs: CS) -> Result<Self, Error<SpiE, GpioE>> {
-        let cc1101 = Cc1101 {
-            spi: spi,
-            cs: cs,
-        };
+        let cc1101 = Cc1101 { spi: spi, cs: cs };
         Ok(cc1101)
     }
 
@@ -58,7 +56,8 @@ where
         len: &mut u8,
         buf: &mut [u8],
     ) -> Result<(), Error<SpiE, GpioE>> {
-        let mut buffer = [Command::FIFO.addr() | 0xC0, 0, 0];
+        let read_burst = 0xC0;
+        let mut buffer = [Command::FIFO.addr() | read_burst, 0, 0];
 
         self.cs.set_low().map_err(Error::Gpio)?;
         self.spi.transfer(&mut buffer).map_err(Error::Spi)?;
@@ -83,7 +82,9 @@ where
         R: Into<Register>,
     {
         self.cs.set_low().map_err(Error::Gpio)?;
-        self.spi.write(&mut [reg.into().waddr(), byte]).map_err(Error::Spi)?;
+        self.spi
+            .write(&mut [reg.into().waddr(), byte])
+            .map_err(Error::Spi)?;
         self.cs.set_high().map_err(Error::Gpio)?;
         Ok(())
     }
@@ -95,6 +96,25 @@ where
     {
         let r = self.read_register(reg)?;
         self.write_register(reg, f(r))?;
+        Ok(())
+    }
+
+    pub fn write_register_burst<R>(
+        &mut self,
+        reg: R,
+        bytes: &[u8],
+    ) -> Result<(), Error<SpiE, GpioE>>
+    where
+        R: Into<Register>,
+    {
+        let write_burst = 0x40;
+        self.cs.set_low().map_err(Error::Gpio)?;
+        // FIXME: confirm we can actually split the write like this?
+        self.spi
+            .write(&[reg.into().waddr() | write_burst])
+            .map_err(Error::Spi)?;
+        self.spi.write(bytes).map_err(Error::Spi)?;
+        self.cs.set_high().map_err(Error::Gpio)?;
         Ok(())
     }
 }
