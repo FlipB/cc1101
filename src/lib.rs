@@ -136,9 +136,7 @@ where
         Ok(())
     }
 
-    /// Configure signal modulation. FIXME: Should be called before setting frequency.
-    /// This is because setting the frequency also updates the pa tables (which should be done
-    /// after changing modulation)
+    /// Configure signal modulation.
     pub fn set_modulation(&mut self, format: Modulation) -> Result<(), Error<SpiE, GpioE>> {
         use lowlevel::types::ModFormat as MF;
 
